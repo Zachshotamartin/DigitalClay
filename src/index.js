@@ -1,77 +1,135 @@
 import { createClayGeometry, sculptDab, vertexNeighbors } from './sculpt.js';
+import { beginStroke, sampleStroke } from './stroke.js';
 
 export const metadata = {
   id: 'digital-clay', title: 'Digital Clay',
   description: 'Shape a continuous mesh with soft, local sculpting brushes. Every stroke moves real vertices.',
-  technique: 'Distance-weighted vertex displacement, Laplacian smoothing, and plane projection on a welded triangular mesh.',
-  instructions: ['Choose a brush and drag across the clay in Sculpt mode.', 'Switch to Orbit to inspect another side. Radius, strength and mirrored strokes work together.', 'Use Stamp front for a keyboard-friendly brush dab, or undo an entire stroke.'],
-  limitations: ['Fixed topology: heavy edits can stretch triangles or self-intersect; there is no remeshing or boolean sculpting.', 'Symmetry mirrors brush positions across the original X plane, not arbitrary edited topology.', 'Undo retains the latest 30 strokes. OBJ exports geometry without material textures.'],
+  technique: 'Spatially resampled brush strokes, welded triangular geometry, surface-normal filtering, and bounded vertex displacement.',
+  instructions: ['Drag directly on the clay to sculpt. Brush size controls the area; strength controls each pass.', 'Right-drag or Alt-drag to orbit. Scroll to zoom, or select Orbit mode. Mirror across X edits both sides.', 'Undo reverses a complete stroke. Escape cancels the current stroke. Stamp front is a keyboard alternative.'],
+  limitations: ['Fixed topology: sustained heavy edits can still stretch or self-intersect. This is not a remeshing or boolean sculptor.', 'Brushes use local distance and surface orientation, not geodesic distance. Nearby folds can still influence one another.', 'Undo retains the latest 30 completed strokes. The vessel starts as a closed blank. OBJ exports geometry without textures.'],
 };
 
 export function createExperiment(ctx) {
   const { THREE: T, root, ui, controls, canvas } = ctx;
-  let preset = 'Pebble', brush = 'Inflate', radius = 0.27, strength = 0.045, symmetry = true, orbit = false, dragging = false, lastPoint = null;
-  let neighbors, undo = [], strokes = 0;
-  const mesh = new T.Mesh(createClayGeometry(preset), new T.MeshStandardMaterial({ color: 0xcb9177, roughness: 0.66, metalness: 0.03 }));
-  mesh.castShadow = mesh.receiveShadow = true; root.add(mesh);
-  const plinth = new T.Mesh(new T.CylinderGeometry(1.48, 1.55, 0.16, 64), new T.MeshStandardMaterial({ color: ctx.palette.dark, roughness: 0.75 }));
-  plinth.position.y = -1.4; plinth.receiveShadow = true; root.add(plinth);
-  const ring = new T.Mesh(new T.RingGeometry(0.96, 1, 64), new T.MeshBasicMaterial({ color: 0xf4e9d1, side: T.DoubleSide, depthTest: false, transparent: true, opacity: 0.9 }));
-  ring.renderOrder = 4; ring.visible = false; root.add(ring);
+  let preset = 'Pebble', brush = 'Inflate', radius = .27, strength = .045, symmetry = true, orbit = false;
+  let neighbors, undo = [], strokes = 0, activeStroke = null;
+  const previousControls = { enabled: controls.enabled, damping: controls.enableDamping, right: controls.mouseButtons.RIGHT };
+  controls.enabled = true; controls.enableDamping = false; controls.mouseButtons.RIGHT = T.MOUSE.ROTATE;
+  const mesh = new T.Mesh(createClayGeometry(preset), new T.MeshStandardMaterial({ color: 0xcb9177, roughness: .66, metalness: .03 }));
+  mesh.name = 'Sculpted clay'; mesh.castShadow = mesh.receiveShadow = true; root.add(mesh);
+  const plinth = new T.Mesh(new T.CylinderGeometry(1.48, 1.55, .16, 64), new T.MeshStandardMaterial({ color: ctx.palette.dark, roughness: .75 }));
+  plinth.receiveShadow = true; root.add(plinth);
+  const preview = new T.Group(); ctx.scene.add(preview);
+  const ringGeometry = new T.RingGeometry(.97, 1, 64);
+  const rings = [1, .45].map(opacity => {
+    const ring = new T.Mesh(ringGeometry, new T.MeshBasicMaterial({ color: 0xf4e9d1, side: T.DoubleSide, depthTest: false, transparent: true, opacity }));
+    ring.renderOrder = 4; ring.visible = false; preview.add(ring); return ring;
+  });
   const report = extra => ctx.setStatus(`${mesh.geometry.attributes.position.count.toLocaleString()} vertices · ${strokes} strokes${extra ? ` · ${extra}` : ''}`);
+  const hideBrush = () => rings.forEach(ring => { ring.visible = false; });
+  const modeCursor = () => { canvas.style.cursor = orbit ? 'grab' : 'crosshair'; };
   function refreshed() {
-    mesh.geometry.attributes.position.needsUpdate = true; mesh.geometry.computeVertexNormals(); mesh.geometry.computeBoundingSphere(); mesh.geometry.computeBoundingBox();
-    plinth.position.y = mesh.geometry.boundingBox.min.y - 0.08; ctx.invalidate();
+    const g = mesh.geometry; g.attributes.position.needsUpdate = true; g.computeVertexNormals(); g.computeBoundingSphere(); g.computeBoundingBox();
+    plinth.position.y = g.boundingBox.min.y - .08; ctx.invalidate();
   }
-  function remember() { undo.push(mesh.geometry.attributes.position.array.slice()); if (undo.length > 30) undo.shift(); undoButton.disabled = false; }
-  function dab(point, axis) {
-    const geometry = mesh.geometry;
-    const result = sculptDab({ positions: geometry.attributes.position.array, normals: geometry.attributes.normal.array, neighbors, center: point.toArray(), normal: axis.toArray(), radius, strength, brush, symmetry });
-    geometry.attributes.position.array.set(result.positions); refreshed(); return result.affected;
+  function pushUndo(snapshot) { undo.push(snapshot); if (undo.length > 30) undo.shift(); undoButton.disabled = false; }
+  function intersectionAt(x, y) { return ctx.pick({ clientX: x, clientY: y }, [mesh])[0]; }
+  function brushHit(hit) {
+    return { point: mesh.worldToLocal(hit.point.clone()), normal: (hit.normal || hit.face.normal).clone().normalize() };
   }
-  function hit(event) { return ctx.pick(event, [mesh])[0]; }
-  function showBrush(intersection) {
-    if (!intersection || orbit) { ring.visible = false; return; }
-    ring.visible = true; ring.position.copy(intersection.point).addScaledVector(intersection.face.normal, 0.012); ring.scale.setScalar(radius);
-    ring.quaternion.setFromUnitVectors(new T.Vector3(0, 0, 1), intersection.face.normal.clone().normalize());
+  function dab(hit, settings) {
+    const { point, normal } = brushHit(hit), g = mesh.geometry;
+    const result = sculptDab({ positions: g.attributes.position.array, normals: g.attributes.normal.array, neighbors, center: point.toArray(), normal: normal.toArray(), ...settings });
+    if (!result.affected || result.maxDisplacement < 1e-10) return false;
+    g.attributes.position.array.set(result.positions); refreshed(); return true;
+  }
+  function settings() { return { brush, radius, strength: Math.min(strength, radius * .2) * .25, symmetry }; }
+  function showBrush(hit) {
+    hideBrush(); if (!hit || orbit) return;
+    const { point, normal } = brushHit(hit), matrix = new T.Matrix3().getNormalMatrix(mesh.matrixWorld);
+    const worldScale = mesh.getWorldScale(new T.Vector3());
+    rings.forEach((ring, index) => {
+      if (index && (!symmetry || Math.abs(point.x) < radius * .04)) return;
+      const p = point.clone(), n = normal.clone(); if (index) { p.x *= -1; n.x *= -1; }
+      mesh.localToWorld(p); n.applyMatrix3(matrix).normalize();
+      ring.position.copy(p).addScaledVector(n, .004); ring.quaternion.setFromUnitVectors(new T.Vector3(0, 0, 1), n);
+      ring.scale.setScalar(radius * Math.max(worldScale.x, worldScale.y, worldScale.z)); ring.visible = true;
+    });
+  }
+  function pixelSpacing(hit) {
+    const worldRadius = radius * mesh.getWorldScale(new T.Vector3()).length() / Math.sqrt(3);
+    const right = new T.Vector3(1, 0, 0).applyQuaternion(ctx.camera.quaternion);
+    const a = hit.point.clone().project(ctx.camera), b = hit.point.clone().addScaledVector(right, worldRadius).project(ctx.camera);
+    const pixels = Math.hypot((b.x - a.x) * canvas.clientWidth / 2, (b.y - a.y) * canvas.clientHeight / 2);
+    return T.MathUtils.clamp(pixels * .18, 2, 12);
+  }
+  function stopStroke(commit = true) {
+    const stroke = activeStroke; if (!stroke) return;
+    activeStroke = null;
+    if (canvas.hasPointerCapture(stroke.pointerId)) canvas.releasePointerCapture(stroke.pointerId);
+    if (!commit) { mesh.geometry.attributes.position.array.set(stroke.before); refreshed(); }
+    else if (stroke.changed) { pushUndo(stroke.before); strokes++; }
+    report(commit ? undefined : 'stroke canceled'); modeCursor(); hideBrush(); ctx.invalidate();
   }
   function reset() {
-    mesh.geometry.dispose(); mesh.geometry = createClayGeometry(preset); neighbors = vertexNeighbors(mesh.geometry.index.array, mesh.geometry.attributes.position.count);
-    mesh.geometry.computeBoundingBox(); plinth.position.y = mesh.geometry.boundingBox.min.y - 0.08;
-    undo = []; strokes = 0; undoButton.disabled = true; report('fresh clay'); ctx.fit(mesh); ctx.invalidate();
+    stopStroke(false); mesh.geometry.dispose(); mesh.geometry = createClayGeometry(preset);
+    neighbors = vertexNeighbors(mesh.geometry.index.array, mesh.geometry.attributes.position.count);
+    refreshed(); undo = []; strokes = 0; undoButton.disabled = true; hideBrush(); report('fresh clay'); ctx.fit(mesh);
   }
   ui.section('Clay & brush');
   ui.select('Starting form', ['Pebble', 'Vessel', 'Creature'], preset, value => { preset = value; reset(); });
-  ui.select('Brush', ['Inflate', 'Smooth', 'Flatten', 'Crease'], brush, value => { brush = value; });
-  ui.select('Pointer mode', ['Sculpt', 'Orbit'], 'Sculpt', value => { orbit = value === 'Orbit'; controls.enabled = orbit; ring.visible = false; canvas.style.cursor = orbit ? 'grab' : 'crosshair'; ctx.invalidate(); });
-  ui.range('Radius', { min: 0.08, max: 0.65, step: 0.01, value: radius, onChange: value => { radius = value; } });
-  ui.range('Strength', { min: 0.005, max: 0.09, step: 0.005, value: strength, onChange: value => { strength = value; } });
-  ui.toggle('Mirror across X', symmetry, value => { symmetry = value; });
+  ui.select('Brush', ['Inflate', 'Smooth', 'Flatten', 'Crease'], brush, value => { stopStroke(); brush = value; });
+  ui.select('Pointer mode', ['Sculpt', 'Orbit'], 'Sculpt', value => { stopStroke(); orbit = value === 'Orbit'; hideBrush(); modeCursor(); ctx.invalidate(); });
+  ui.range('Radius', { min: .1, max: .65, step: .01, value: radius, onChange: value => { radius = value; hideBrush(); ctx.invalidate(); } });
+  ui.range('Strength', { min: .005, max: .09, step: .005, value: strength, onChange: value => { strength = value; } });
+  ui.toggle('Mirror across X', symmetry, value => { symmetry = value; hideBrush(); ctx.invalidate(); });
   ui.toggle('Wireframe', false, value => { mesh.material.wireframe = value; ctx.invalidate(); });
   ui.select('Clay finish', [{ label: 'Terracotta', value: '0xcb9177' }, { label: 'Porcelain', value: '0xe7ece1' }, { label: 'Sage', value: '0xb8cd99' }], '0xcb9177', value => { mesh.material.color.setHex(Number(value)); ctx.invalidate(); });
   ui.section('Shape history');
   ui.button('Stamp front', () => {
-    const p = mesh.geometry.attributes.position, n = mesh.geometry.attributes.normal;
+    stopStroke(); const g = mesh.geometry, p = g.attributes.position, n = g.attributes.normal;
     let index = 0; for (let i = 1; i < p.count; i++) if (p.getZ(i) > p.getZ(index)) index = i;
-    remember(); const affected = dab(new T.Vector3().fromBufferAttribute(p, index), new T.Vector3().fromBufferAttribute(n, index)); strokes++; report(`${affected} vertices changed`);
-  }, { primary: true });
-  const undoButton = ui.button('Undo stroke', () => { const previous = undo.pop(); if (!previous) return; mesh.geometry.attributes.position.array.set(previous); strokes = Math.max(0, strokes - 1); refreshed(); undoButton.disabled = !undo.length; report('stroke undone'); });
-  ui.button('Reset clay', reset); ui.button('Export sculpture OBJ', () => ctx.exportOBJ(mesh, 'digital-clay.obj'));
-  ui.note('Sculpt edits the mesh itself. Use lighter repeated strokes to avoid stretched or intersecting triangles.');
-  ctx.listen(canvas, 'pointerdown', event => {
-    if (orbit || event.button !== 0) return;
-    const intersection = hit(event); if (!intersection) return;
-    event.preventDefault(); remember(); dragging = true; lastPoint = intersection.point.clone(); canvas.setPointerCapture(event.pointerId);
-    dab(intersection.point, intersection.face.normal); strokes++; report();
+    const before = p.array.slice(); mesh.updateWorldMatrix(true, false);
+    if (dab({ point: mesh.localToWorld(new T.Vector3().fromBufferAttribute(p, index)), normal: new T.Vector3().fromBufferAttribute(n, index) }, settings())) { pushUndo(before); strokes++; report(); }
   });
+  const undoButton = ui.button('Undo stroke', () => { stopStroke(false); const previous = undo.pop(); if (!previous) return; mesh.geometry.attributes.position.array.set(previous); strokes = Math.max(0, strokes - 1); refreshed(); undoButton.disabled = !undo.length; hideBrush(); report('stroke undone'); });
+  ui.button('Reset clay', reset); ui.button('Export sculpture OBJ', () => { stopStroke(); ctx.exportOBJ(mesh, 'digital-clay.obj'); });
+  ui.note('Drag on the surface. Right-drag to orbit; scroll to zoom. Strokes are spaced by distance, so moving slowly or holding still does not dig deeper.');
+  // Capture phase gives sculpting ownership before OrbitControls starts a drag.
+  ctx.listen(canvas, 'pointerdown', event => {
+    if (activeStroke) { event.preventDefault(); event.stopImmediatePropagation(); return; }
+    if (orbit || event.button !== 0 || event.altKey) return;
+    event.preventDefault(); event.stopImmediatePropagation();
+    const hit = intersectionAt(event.clientX, event.clientY); if (!hit) return;
+    canvas.focus({ preventScroll: true });
+    activeStroke = { pointerId: event.pointerId, before: mesh.geometry.attributes.position.array.slice(), sampler: beginStroke([event.clientX, event.clientY], pixelSpacing(hit)), settings: settings(), changed: false };
+    canvas.setPointerCapture(event.pointerId); activeStroke.changed = dab(hit, activeStroke.settings); showBrush(intersectionAt(event.clientX, event.clientY));
+  }, { capture: true });
+  function moveStroke(event) {
+    if (!activeStroke || activeStroke.pointerId !== event.pointerId) return;
+    const events = event.getCoalescedEvents?.();
+    for (const sample of events?.length ? events : [event]) for (const [x, y] of sampleStroke(activeStroke.sampler, [sample.clientX, sample.clientY])) {
+      const hit = intersectionAt(x, y); if (hit) activeStroke.changed = dab(hit, activeStroke.settings) || activeStroke.changed;
+    }
+  }
   ctx.listen(canvas, 'pointermove', event => {
-    const intersection = hit(event); showBrush(intersection);
-    if (dragging && intersection && (!lastPoint || lastPoint.distanceTo(intersection.point) > radius * 0.07)) { dab(intersection.point, intersection.face.normal); lastPoint = intersection.point.clone(); }
+    if (activeStroke && activeStroke.pointerId !== event.pointerId) return;
+    moveStroke(event);
+    if (event.buttons && !activeStroke) hideBrush(); else showBrush(intersectionAt(event.clientX, event.clientY));
     ctx.invalidate();
   });
-  const release = event => { dragging = false; lastPoint = null; if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId); };
-  ctx.listen(canvas, 'pointerup', release); ctx.listen(canvas, 'pointercancel', release);
-  ctx.listen(canvas, 'pointerleave', () => { ring.visible = false; ctx.invalidate(); });
-  controls.enabled = false; canvas.style.cursor = 'crosshair'; reset();
-  return { dispose() { controls.enabled = true; canvas.style.cursor = ''; undo = []; } };
+  ctx.listen(canvas, 'pointerup', event => { if (activeStroke?.pointerId === event.pointerId) { moveStroke(event); stopStroke(); } });
+  ctx.listen(canvas, 'pointercancel', event => { if (activeStroke?.pointerId === event.pointerId) stopStroke(false); });
+  ctx.listen(canvas, 'lostpointercapture', event => { if (activeStroke?.pointerId === event.pointerId) stopStroke(false); });
+  ctx.listen(canvas, 'pointerleave', () => { hideBrush(); ctx.invalidate(); });
+  ctx.listen(canvas, 'wheel', event => { if (activeStroke) { event.preventDefault(); event.stopImmediatePropagation(); } hideBrush(); }, { capture: true, passive: false });
+  ctx.listen(canvas, 'keydown', event => { if (event.key === 'Escape') { stopStroke(false); event.preventDefault(); } });
+  ctx.listen(window, 'blur', () => stopStroke(false));
+  ctx.listen(document, 'visibilitychange', () => { if (document.hidden) stopStroke(false); });
+  modeCursor(); reset();
+  return {
+    deactivate() { stopStroke(false); hideBrush(); },
+    activate() { modeCursor(); hideBrush(); },
+    dispose() { stopStroke(false); controls.enabled = previousControls.enabled; controls.enableDamping = previousControls.damping; controls.mouseButtons.RIGHT = previousControls.right; canvas.style.cursor = ''; undo = []; preview.removeFromParent(); ringGeometry.dispose(); rings.forEach(ring => ring.material.dispose()); },
+  };
 }

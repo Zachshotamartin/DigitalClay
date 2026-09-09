@@ -1,22 +1,24 @@
 [
   {
     "file": "01.png",
-    "caption": "Inflating a terracotta form",
-    "alt": "Terracotta clay mesh with an inflated front surface on a dark round plinth",
+    "caption": "Raised ribs on a closed vessel blank",
+    "alt": "Terracotta clay form with curved raised ribs sculpted across its front surface",
     "steps": [
-      "Pebble preset",
-      "Inflate brush, radius0.52, strength0.07",
-      "8 front stamps"
+      "Vessel preset, front camera view",
+      "Mirror across X enabled",
+      "Inflate brush, radius 0.24, strength 0.055",
+      "Two curved drag paths, one pass each"
     ]
   },
   {
     "file": "02.png",
-    "caption": "Crease and inflate on a new blank",
-    "alt": "Sage-colored clay sculpture shaped with short creases and an inflated front",
+    "caption": "A mask shaped with crease, inflate, and smooth brushes",
+    "alt": "Sage clay mask with recessed eyes, a raised nose, and a curved mouth made by direct brush strokes",
     "steps": [
-      "Creature preset, sage finish",
-      "2 pointer-driven crease strokes, radius0.18",
-      "5 front inflate stamps, radius0.36"
+      "Creature preset, sage finish, front camera view",
+      "Mirrored curved crease strokes form the eyes",
+      "Narrow curved crease strokes form the mouth",
+      "Inflate strokes build the nose; smooth strokes soften eye edges"
     ]
   }
 ]
