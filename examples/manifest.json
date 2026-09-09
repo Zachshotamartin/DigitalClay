@@ -1,0 +1,22 @@
+[
+  {
+    "file": "01.png",
+    "caption": "Inflating a terracotta form",
+    "alt": "Terracotta clay mesh with an inflated front surface on a dark round plinth",
+    "steps": [
+      "Pebble preset",
+      "Inflate brush, radius0.52, strength0.07",
+      "8 front stamps"
+    ]
+  },
+  {
+    "file": "02.png",
+    "caption": "Crease and inflate on a new blank",
+    "alt": "Sage-colored clay sculpture shaped with short creases and an inflated front",
+    "steps": [
+      "Creature preset, sage finish",
+      "2 pointer-driven crease strokes, radius0.18",
+      "5 front inflate stamps, radius0.36"
+    ]
+  }
+]
